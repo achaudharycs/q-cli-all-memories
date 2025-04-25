@@ -1,64 +1,28 @@
-use std::collections::{
-    HashMap,
-    VecDeque,
-};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use fig_api_client::model::{
-    AssistantResponseMessage,
-    ChatMessage,
-    ConversationState as FigConversationState,
-    Tool,
-    ToolInputSchema,
-    ToolResult,
-    ToolResultContentBlock,
-    ToolSpecification,
-    ToolUse,
-    UserInputMessage,
-    UserInputMessageContext,
+    AssistantResponseMessage, ChatMessage, ConversationState as FigConversationState, Tool, ToolInputSchema,
+    ToolResult, ToolResultContentBlock, ToolSpecification, ToolUse, UserInputMessage, UserInputMessageContext,
 };
 use fig_os_shim::Context;
 use mcp_client::Prompt;
-use rand::distr::{
-    Alphanumeric,
-    SampleString,
-};
-use tracing::{
-    debug,
-    error,
-    info,
-    warn,
-};
+use rand::distr::{Alphanumeric, SampleString};
+use tracing::{debug, error, info, warn};
 
-use super::consts::{
-    MAX_CHARS,
-    MAX_CONVERSATION_STATE_HISTORY_LEN,
-};
+use super::consts::{MAX_CHARS, MAX_CONVERSATION_STATE_HISTORY_LEN};
 use super::context::ContextManager;
-use super::hooks::{
-    Hook,
-    HookTrigger,
-};
+use super::hooks::{Hook, HookTrigger};
+use super::memory::Memory;
 use super::message::{
-    AssistantMessage,
-    ToolUseResult,
-    ToolUseResultBlock,
-    UserMessage,
-    UserMessageContent,
-    build_env_state,
+    AssistantMessage, ToolUseResult, ToolUseResultBlock, UserMessage, UserMessageContent, build_env_state,
 };
 use super::shared_writer::SharedWriter;
-use super::token_counter::{
-    CharCount,
-    CharCounter,
-};
-use super::tools::{
-    InputSchema,
-    QueuedTool,
-    ToolOrigin,
-    ToolSpec,
-    serde_value_to_document,
-};
+use super::token_counter::{CharCount, CharCounter};
+use super::tools::{InputSchema, QueuedTool, ToolOrigin, ToolSpec, serde_value_to_document};
+
+pub const NUM_MESSAGES_TO_REMEMBER: usize = 50;
+
 /// Tracks state related to an ongoing conversation.
 #[derive(Debug, Clone)]
 pub struct ConversationState {
@@ -188,7 +152,7 @@ impl ConversationState {
         self.next_message = None;
     }
 
-    pub async fn set_next_user_message(&mut self, input: String) {
+    pub async fn set_next_user_message(&mut self, input: String, memories: Vec<Memory>, memory_prompt: String) {
         debug_assert!(self.next_message.is_none(), "next_message should not exist");
         if let Some(next_message) = self.next_message.as_ref() {
             warn!(?next_message, "next_message should not exist");
@@ -201,8 +165,58 @@ impl ConversationState {
             input
         };
 
+        let conversation_history = if let Some(context_manager) = &self.context_manager {
+            match context_manager.get_conversation_history(NUM_MESSAGES_TO_REMEMBER).await {
+                Ok(history) => {
+                    if !history.is_empty() {
+                        let mut context_content = String::new();
+                        context_content.push_str("--- CONVERSATION HISTORY BEGIN ---\n");
+                        context_content.push_str(&history);
+                        context_content.push_str("--- CONVERSATION HISTORY END ---\n\n");
+                        Some(context_content)
+                    } else {
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to get context history: {}", e);
+                    None
+                },
+            }
+        } else {
+            None
+        };
+
+        let input = if let Some(history) = conversation_history {
+            format!("{}\n{}", history, input)
+        } else {
+            format!("{}--- CONVERSATION HISTORY END ---", input)
+        };
+
+        let input = format!(
+            "{}\n--- USER PREFERENCES BEGIN ---\n{}\n--- USER PREFERENCES END ---\n{}",
+            memory_prompt,
+            memories
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<String>>()
+                .join("\n"),
+            input
+        );
+
         let msg = UserMessage::new_prompt(input);
         self.next_message = Some(msg);
+    }
+
+    pub async fn save_session(&self) -> Result<(), eyre::Error> {
+        if let Some(context_manager) = &self.context_manager {
+            if let Some(last_message) = self.history.back() {
+                context_manager
+                    .add_message_to_conversation_history(last_message.clone())
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Sets the response message according to the currently set [Self::next_message].
@@ -760,15 +774,9 @@ fn format_hook_context<'a>(hook_results: impl IntoIterator<Item = &'a (Hook, Str
 
 #[cfg(test)]
 mod tests {
-    use fig_api_client::model::{
-        AssistantResponseMessage,
-        ToolResultStatus,
-    };
+    use fig_api_client::model::{AssistantResponseMessage, ToolResultStatus};
 
-    use super::super::context::{
-        AMAZONQ_FILENAME,
-        profile_context_path,
-    };
+    use super::super::context::{AMAZONQ_FILENAME, profile_context_path};
     use super::super::message::AssistantToolUse;
     use super::*;
     use crate::cli::chat::tool_manager::ToolManager;
@@ -874,12 +882,16 @@ mod tests {
 
         // First, build a large conversation history. We need to ensure that the order is always
         // User -> Assistant -> User -> Assistant ...and so on.
-        conversation_state.set_next_user_message("start".to_string()).await;
+        conversation_state
+            .set_next_user_message("start".to_string(), Vec::new(), String::new())
+            .await;
         for i in 0..=(MAX_CONVERSATION_STATE_HISTORY_LEN + 100) {
             let s = conversation_state.as_sendable_conversation_state(true).await;
             assert_conversation_state_invariants(s, i);
             conversation_state.push_assistant_message(AssistantMessage::new_response(None, i.to_string()));
-            conversation_state.set_next_user_message(i.to_string()).await;
+            conversation_state
+                .set_next_user_message(i.to_string(), Vec::new(), String::new())
+                .await;
         }
     }
 
@@ -894,7 +906,9 @@ mod tests {
             None,
         )
         .await;
-        conversation_state.set_next_user_message("start".to_string()).await;
+        conversation_state
+            .set_next_user_message("start".to_string(), Vec::new(), String::new())
+            .await;
         for i in 0..=(MAX_CONVERSATION_STATE_HISTORY_LEN + 100) {
             let s = conversation_state.as_sendable_conversation_state(true).await;
             assert_conversation_state_invariants(s, i);
@@ -921,7 +935,9 @@ mod tests {
             None,
         )
         .await;
-        conversation_state.set_next_user_message("start".to_string()).await;
+        conversation_state
+            .set_next_user_message("start".to_string(), Vec::new(), String::new())
+            .await;
         for i in 0..=(MAX_CONVERSATION_STATE_HISTORY_LEN + 100) {
             let s = conversation_state.as_sendable_conversation_state(true).await;
             assert_conversation_state_invariants(s, i);
@@ -940,7 +956,9 @@ mod tests {
                 }]);
             } else {
                 conversation_state.push_assistant_message(AssistantMessage::new_response(None, i.to_string()));
-                conversation_state.set_next_user_message(i.to_string()).await;
+                conversation_state
+                    .set_next_user_message(i.to_string(), Vec::new(), String::new())
+                    .await;
             }
         }
     }
@@ -956,7 +974,9 @@ mod tests {
 
         // First, build a large conversation history. We need to ensure that the order is always
         // User -> Assistant -> User -> Assistant ...and so on.
-        conversation_state.set_next_user_message("start".to_string()).await;
+        conversation_state
+            .set_next_user_message("start".to_string(), Vec::new(), String::new())
+            .await;
         for i in 0..=(MAX_CONVERSATION_STATE_HISTORY_LEN + 100) {
             let s = conversation_state.as_sendable_conversation_state(true).await;
 
@@ -978,7 +998,9 @@ mod tests {
             assert_conversation_state_invariants(s, i);
 
             conversation_state.push_assistant_message(AssistantMessage::new_response(None, i.to_string()));
-            conversation_state.set_next_user_message(i.to_string()).await;
+            conversation_state
+                .set_next_user_message(i.to_string(), Vec::new(), String::new())
+                .await;
         }
     }
 
@@ -1019,7 +1041,9 @@ mod tests {
         .await;
 
         // Simulate conversation flow
-        conversation_state.set_next_user_message("start".to_string()).await;
+        conversation_state
+            .set_next_user_message("start".to_string(), Vec::new(), String::new())
+            .await;
         for i in 0..=5 {
             let s = conversation_state.as_sendable_conversation_state(true).await;
             let hist = s.history.as_ref().unwrap();
@@ -1041,7 +1065,9 @@ mod tests {
             );
 
             conversation_state.push_assistant_message(AssistantMessage::new_response(None, i.to_string()));
-            conversation_state.set_next_user_message(i.to_string()).await;
+            conversation_state
+                .set_next_user_message(i.to_string(), Vec::new(), String::new())
+                .await;
         }
     }
 }

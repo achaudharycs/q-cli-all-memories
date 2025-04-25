@@ -1,31 +1,28 @@
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::{
-    Path,
-    PathBuf,
-};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use eyre::{
-    Result,
-    eyre,
-};
+use super::message::{AssistantMessage, UserMessage, UserMessageContent};
+use eyre::{Result, eyre};
 use fig_os_shim::Context;
 use fig_util::directories;
 use glob::glob;
 use regex::Regex;
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use super::hooks::{
-    Hook,
-    HookExecutor,
-};
+use super::hooks::{Hook, HookExecutor};
 
 pub const AMAZONQ_FILENAME: &str = "AmazonQ.md";
+
+// where to store conversation history
+const HISTORY_FILE_NAME: &str = "memory_output/conversation_history.json";
+
+#[derive(Serialize, Deserialize)]
+pub struct ConversationHistory {
+    messages: Vec<Vec<String>>,
+}
 
 /// Configuration for context files, containing paths to include in the context.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -83,6 +80,70 @@ impl ContextManager {
             profile_config,
             hook_executor: HookExecutor::new(),
         })
+    }
+
+    pub async fn load_conversation_history(&self) -> Result<ConversationHistory> {
+        let history_file = self.ctx.fs().chroot_path_str(HISTORY_FILE_NAME);
+        if self.ctx.fs().exists(&history_file) {
+            let content = self.ctx.fs().read_to_string(&history_file).await?;
+            Ok(serde_json::from_str(&content)?)
+        } else {
+            Ok(ConversationHistory { messages: Vec::new() })
+        }
+    }
+
+    pub async fn add_message_to_conversation_history(
+        &self,
+        last_message: (UserMessage, AssistantMessage),
+    ) -> Result<()> {
+        let mut conversation_history = self.load_conversation_history().await?;
+
+        let (user_msg, assistant_msg) = last_message;
+
+        // Create a vector with both formatted messages
+        let new_message = vec![
+            // Format user message
+            format!(
+                "User: {}",
+                match user_msg.content {
+                    UserMessageContent::Prompt { prompt } => prompt,
+                    UserMessageContent::CancelledToolUses { prompt, .. } => prompt.unwrap_or_default(),
+                    UserMessageContent::ToolUseResults { .. } => String::new(),
+                }
+                .split("--- CONVERSATION HISTORY END ---")
+                .last()
+                .unwrap_or(&String::new())
+                .trim()
+                .to_string()
+            ),
+            // Format assistant message
+            format!("Assistant: {}", match assistant_msg {
+                AssistantMessage::Response { content, .. } => content,
+                AssistantMessage::ToolUse { content, .. } => content,
+            }),
+        ];
+
+        conversation_history.messages.push(new_message);
+
+        let history_content = serde_json::to_string_pretty(&conversation_history)?;
+        let history_file = self.ctx.fs().chroot_path_str(HISTORY_FILE_NAME);
+        self.ctx.fs().write(&history_file, history_content).await?;
+
+        Ok(())
+    }
+
+    pub async fn get_conversation_history(&self, num_messages: usize) -> Result<String> {
+        let history = self.load_conversation_history().await?;
+        let mut context = String::new();
+
+        for (i, message) in history.messages.iter().enumerate().rev().take(num_messages) {
+            context.push_str(&format!("--- Message {}\n", history.messages.len() - i));
+            for line in message {
+                context.push_str(line);
+            }
+            context.push_str("\n");
+        }
+        Ok(context)
     }
 
     /// Save the current configuration to disk.

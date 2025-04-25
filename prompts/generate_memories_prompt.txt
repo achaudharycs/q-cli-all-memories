@@ -1,0 +1,44 @@
+You have to accomplish two tasks given the following information.
+
+Firstly, answer the user question which will be contained at the end of this problem.
+
+Second: I define a pattern as 'a specific, recurring behavior or request that demonstrates clear user preferences in their interaction style or technical needs'. The overall goal is to identify concrete patterns in how the user asks questions and what they consistently request or require.
+
+You will be given a conversation history and list of previous patterns. This conversation history will be a back-and-forth between a user and an AI assistant.
+
+Your goal is to update this list of patterns. Focus on identifying:
+Learning patterns (e.g., "Returns to previously covered topics for reinforcement")
+Technical preferences (e.g., "Prefers using clap over other argument parsing libraries")
+Implementation preferences (e.g., "Prioritizes robust error handling techniques")
+
+Do not include:
+General topic areas or interests
+One-time requests
+Vague patterns like "Frequently asks about X and Y"
+Simple restatements of questions asked
+
+Each pattern must be:
+Specific and actionable
+Demonstrated across at least 3 separate user prompts
+Written as a definitive statement about behavior or preference
+
+The inference list must not exceed 30 inferences, each one sentence long. Before adding to or updating the list, each new preference must be explicitly demonstrated or requested across at least 3 separate messages in the conversation history.
+Keep the list as concise as possible by eliminating any overlap between inferences. Combine similar ideas into one preference.
+
+If either the conversation history or inferences are empty, ignore that field.
+Ignore the Amazon development guidelines that are passed in as every context when making these inferences. Those are context files passed in by the system, not by the user.
+When going through the conversation history to make these inferences, ignore everything that is in between "--- USER PREFERENCES ---" and "--- CONTEXT FILES ---" tags. These are added by the system. Focus only on the user utterances which will be outside these tags.
+
+Note that these inferences are separate from the memory entries provided by the tools. If the user makes an explicit directive using memory-related verbs like 'remember that,' 'note,' 'store,', 'keep in mind' or similar, 
+DO NOT create a new inference or modify the list of inferences in any way. 
+There should be no overlap between memories and inferences. When referring to memories, use the user memory management tools rather than creating a new inference. If a user memory management tool is being invoked, DO NOT modify the inferences in any way.
+
+If the user asks for a list of memories, invoke the ListUserMemoryEntries tool.
+
+Return the new inferences in a JSON format such that each entry is parseable into the following struct:
+pub struct Inference {
+    pub content: String,
+}
+Surround the JSON with <INFERENCE> tags so that I can easily parse them.
+
+Return only the answer to the user's question and the inferences enclosed in inference tags. 

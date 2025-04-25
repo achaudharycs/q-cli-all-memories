@@ -4,6 +4,7 @@ mod context;
 mod conversation_state;
 mod hooks;
 mod input_source;
+mod memory;
 mod message;
 mod parse;
 mod parser;
@@ -16,80 +17,31 @@ mod tools;
 mod util;
 
 use std::borrow::Cow;
-use std::collections::{
-    HashMap,
-    HashSet,
-    VecDeque,
-};
-use std::io::{
-    IsTerminal,
-    Read,
-    Write,
-};
-use std::process::{
-    Command as ProcessCommand,
-    ExitCode,
-};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{IsTerminal, Read, Write};
+use std::process::{Command as ProcessCommand, ExitCode};
 use std::sync::Arc;
 use std::time::Duration;
-use std::{
-    env,
-    fs,
-};
+use std::{env, fs};
 
-use command::{
-    Command,
-    PromptsSubcommand,
-    ToolsSubcommand,
-};
+use command::{Command, PromptsSubcommand, ToolsSubcommand};
 use consts::CONTEXT_WINDOW_SIZE;
 use context::ContextManager;
-use conversation_state::{
-    ConversationState,
-    TokenWarningLevel,
-};
-use crossterm::style::{
-    Attribute,
-    Color,
-    Stylize,
-};
+use conversation_state::{ConversationState, TokenWarningLevel};
+use crossterm::style::{Attribute, Color, Stylize};
 use crossterm::terminal::ClearType;
-use crossterm::{
-    cursor,
-    execute,
-    queue,
-    style,
-    terminal,
-};
+use crossterm::{cursor, execute, queue, style, terminal};
 use dialoguer::console::strip_ansi_codes;
-use eyre::{
-    ErrReport,
-    Result,
-    bail,
-};
+use eyre::{ErrReport, Result, bail};
 use fig_api_client::StreamingClient;
 use fig_api_client::clients::SendMessageOutput;
-use fig_api_client::model::{
-    ChatResponseStream,
-    Tool as FigTool,
-    ToolResultStatus,
-};
+use fig_api_client::model::{ChatResponseStream, Tool as FigTool, ToolResultStatus};
 use fig_os_shim::Context;
-use fig_settings::{
-    Settings,
-    State,
-};
+use fig_settings::{Settings, State};
 use fig_util::CLI_BINARY_NAME;
-use hooks::{
-    Hook,
-    HookTrigger,
-};
-use message::{
-    AssistantMessage,
-    AssistantToolUse,
-    ToolUseResult,
-    ToolUseResultBlock,
-};
+use hooks::{Hook, HookTrigger};
+use memory::MemoryManager;
+use message::{AssistantMessage, AssistantToolUse, ToolUseResult, ToolUseResultBlock};
 use shared_writer::SharedWriter;
 
 /// Help text for the compact command
@@ -122,59 +74,21 @@ that may eventually reach memory constraints.
     )
 }
 use input_source::InputSource;
-use mcp_client::{
-    Prompt,
-    PromptGetResult,
-};
-use parse::{
-    ParseState,
-    interpret_markdown,
-};
-use parser::{
-    RecvErrorKind,
-    ResponseParser,
-};
+use mcp_client::{Prompt, PromptGetResult};
+use parse::{ParseState, interpret_markdown};
+use parser::{RecvErrorKind, ResponseParser};
 use regex::Regex;
 use serde_json::Map;
-use spinners::{
-    Spinner,
-    Spinners,
-};
+use spinners::{Spinner, Spinners};
 use thiserror::Error;
-use token_counter::{
-    TokenCount,
-    TokenCounter,
-};
-use tokio::signal::unix::{
-    SignalKind,
-    signal,
-};
-use tool_manager::{
-    GetPromptError,
-    McpServerConfig,
-    PromptBundle,
-    ToolManager,
-    ToolManagerBuilder,
-};
+use token_counter::{TokenCount, TokenCounter};
+use tokio::signal::unix::{SignalKind, signal};
+use tool_manager::{GetPromptError, McpServerConfig, PromptBundle, ToolManager, ToolManagerBuilder};
 use tools::gh_issue::GhIssueContext;
-use tools::{
-    QueuedTool,
-    Tool,
-    ToolPermissions,
-    ToolSpec,
-};
-use tracing::{
-    debug,
-    error,
-    trace,
-    warn,
-};
+use tools::{QueuedTool, Tool, ToolPermissions, ToolSpec};
+use tracing::{debug, error, trace, warn};
 use unicode_width::UnicodeWidthStr;
-use util::{
-    animate_output,
-    play_notification_bell,
-    region_check,
-};
+use util::{animate_output, play_notification_bell, region_check};
 use uuid::Uuid;
 use winnow::Partial;
 use winnow::stream::Offset;
@@ -376,6 +290,8 @@ pub async fn chat(
         }
     }
 
+    let memory_manager = MemoryManager::new(Arc::clone(&ctx)).await?;
+
     let mut chat = ChatContext::new(
         ctx,
         Settings::new(),
@@ -390,6 +306,7 @@ pub async fn chat(
         profile,
         tool_config,
         tool_permissions,
+        Some(Arc::new(memory_manager)),
     )
     .await?;
 
@@ -461,6 +378,7 @@ pub struct ChatContext {
     failed_request_ids: Vec<String>,
     /// Pending prompts to be sent
     pending_prompts: VecDeque<Prompt>,
+    memory_manager: Option<Arc<MemoryManager>>,
 }
 
 impl ChatContext {
@@ -479,6 +397,7 @@ impl ChatContext {
         profile: Option<String>,
         tool_config: HashMap<String, ToolSpec>,
         tool_permissions: ToolPermissions,
+        memory_manager: Option<Arc<MemoryManager>>,
     ) -> Result<Self> {
         let ctx_clone = Arc::clone(&ctx);
         let output_clone = output.clone();
@@ -500,6 +419,7 @@ impl ChatContext {
             tool_manager,
             failed_request_ids: Vec::new(),
             pending_prompts: VecDeque::new(),
+            memory_manager,
         })
     }
 }
@@ -1286,7 +1206,27 @@ impl ChatContext {
                 if pending_tool_index.is_some() {
                     self.conversation_state.abandon_tool_use(tool_uses, user_input);
                 } else {
-                    self.conversation_state.set_next_user_message(user_input).await;
+                    if let Some(memory_manager) = &self.memory_manager {
+                        let memories = match memory_manager.load_memories().await {
+                            Ok(mems) => mems,
+                            Err(e) => {
+                                error!("Failed to load memories {}", e);
+                                Vec::new()
+                            },
+                        };
+
+                        let memory_prompt = match memory_manager.load_memory_prompt().await {
+                            Ok(prompt) => prompt,
+                            Err(e) => {
+                                error!("Failed to load memory prompt {}", e);
+                                String::new()
+                            },
+                        };
+
+                        self.conversation_state
+                            .set_next_user_message(user_input, memories, memory_prompt)
+                            .await;
+                    }
                 }
 
                 let conv_state = self.conversation_state.as_sendable_conversation_state(true).await;
@@ -2761,7 +2701,7 @@ impl ChatContext {
         let mut ended = false;
         let mut parser = ResponseParser::new(response);
         let mut state = ParseState::new(Some(self.terminal_width()));
-
+        let mut is_memory_section = false;
         let mut tool_uses = Vec::new();
         let mut tool_name_being_recvd: Option<String> = None;
 
@@ -2777,7 +2717,14 @@ impl ChatContext {
                             tool_name_being_recvd = Some(name);
                         },
                         parser::ResponseEvent::AssistantText(text) => {
-                            buf.push_str(&text);
+                            if text.contains("<INFERENCE>") {
+                                is_memory_section = true;
+                                // Don't add this to buffer
+                            }
+                            // Only add to buffer if we're not in memory section
+                            if !is_memory_section {
+                                buf.push_str(&text);
+                            }
                         },
                         parser::ResponseEvent::ToolUse(tool_use) => {
                             if self.interactive && self.spinner.is_some() {
@@ -2798,7 +2745,33 @@ impl ChatContext {
                             if message.content() == RESPONSE_TIMEOUT_CONTENT {
                                 error!(?request_id, ?message, "Encountered an unexpected model response");
                             }
-                            self.conversation_state.push_assistant_message(message);
+                            // Split the message into answer and memories
+                            let parts: Vec<&str> = message.content().split("<INFERENCE>").collect();
+
+                            if parts.len() > 1 {
+                                let answer = parts[0].trim().to_string();
+                                self.conversation_state
+                                    .push_assistant_message(AssistantMessage::new_response(None, answer));
+
+                                if let Some(memory_manager) = &self.memory_manager {
+                                    let memory_content = format!("<INFERENCE>{}", parts[1]);
+                                    let memories = memory_manager.parse_memory_response(&memory_content).await;
+
+                                    match memories {
+                                        Ok(mems) => {
+                                            if let Err(e) = memory_manager.save_memories(&mems).await {
+                                                error!("Failed to save memories: {}", e);
+                                            }
+                                        },
+                                        Err(e) => {
+                                            error!("Failed to parse memories: {}", e);
+                                        },
+                                    };
+                                }
+                            } else {
+                                // If there are no memories, just push the entire message as the answer
+                                self.conversation_state.push_assistant_message(message);
+                            }
                             ended = true;
                         },
                     }
@@ -2832,6 +2805,8 @@ impl ChatContext {
                                 .set_next_user_message(
                                     "You took too long to respond - try to split up the work into smaller steps."
                                         .to_string(),
+                                    Vec::new(),
+                                    String::new(),
                                 )
                                 .await;
                             self.send_tool_use_telemetry().await;
@@ -2961,6 +2936,9 @@ impl ChatContext {
                     }
                 }
 
+                if let Err(e) = self.conversation_state.save_session().await {
+                    error!("Failed to save conversation history: {}", e);
+                }
                 break;
             }
         }
@@ -3380,6 +3358,7 @@ mod tests {
             None,
             tool_config,
             ToolPermissions::new(0),
+            None,
         )
         .await
         .unwrap()
@@ -3521,6 +3500,7 @@ mod tests {
             None,
             tool_config,
             ToolPermissions::new(0),
+            None,
         )
         .await
         .unwrap()
@@ -3615,6 +3595,7 @@ mod tests {
             None,
             tool_config,
             ToolPermissions::new(0),
+            None,
         )
         .await
         .unwrap()
@@ -3688,6 +3669,7 @@ mod tests {
             None,
             tool_config,
             ToolPermissions::new(0),
+            None,
         )
         .await
         .unwrap()
