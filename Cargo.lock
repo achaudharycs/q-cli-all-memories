@@ -75,7 +75,7 @@ dependencies = [
  "serde_yaml",
  "shell-color",
  "tracing",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.2",
  "vte 0.15.0",
 ]
 
@@ -1538,7 +1538,7 @@ dependencies = [
  "strsim",
  "terminal_size",
  "unicase",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -1726,7 +1726,7 @@ dependencies = [
  "encode_unicode",
  "libc",
  "once_cell",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.2",
  "windows-sys 0.59.0",
 ]
 
@@ -4458,7 +4458,7 @@ dependencies = [
  "console",
  "number_prefix",
  "portable-atomic",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.2",
  "web-time",
 ]
 
@@ -6897,7 +6897,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.2",
  "url",
  "uuid",
  "walkdir",
@@ -7662,7 +7662,7 @@ dependencies = [
  "radix_trie",
  "rustyline-derive",
  "unicode-segmentation",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.2",
  "utf8parse",
  "windows-sys 0.59.0",
 ]
@@ -8117,7 +8117,7 @@ dependencies = [
  "time",
  "timer",
  "tuikit",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.2",
  "vte 0.15.0",
  "which 7.0.3",
 ]
@@ -9242,9 +9242,9 @@ checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "unicode-width"
-version = "0.2.0"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fc81956842c57dac11422a97c3b8195a1ff727f06e85c84ed2e8aa277c9a0fd"
+checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "unsafe-libyaml"
